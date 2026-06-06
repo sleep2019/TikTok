@@ -31,7 +31,7 @@ APP_ICON = resource_path("logo.ico")
 AUTH_FILE = os.path.join(os.path.expanduser("~"), ".tiktok_ads_auth.dat")
 QQ_NUM = "349163112"
 WECHAT_ID = "CloudPark3000"
-APP_TITLE = "TikTok投流码专属自动化客户端"
+APP_TITLE = "TikTok投流码专属自动化客户端 v1.0"  # 1. 加版本号
 
 
 class AuthManager:
@@ -135,12 +135,12 @@ ssl._create_default_https_context = ssl._create_unverified_context
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 TIKTOK_SHORT_PATTERN = re.compile(r"https://www\.tiktok\.com/t/\S+")
 ADS_CODE_PATTERN = re.compile(r"#[\w/=+]+")
-# 提取VID的正则，匹配/video/后的数字串
 VID_PATTERN = re.compile(r'/video/(\d+)')
 
 
-def get_us_date():
-    return (datetime.now() - timedelta(1)).strftime("%Y/%m/%d")
+# 2. 日期改为北京时间
+def get_beijing_date():
+    return datetime.now().strftime("%Y/%m/%d")
 
 
 def parse_single_short_url(url):
@@ -151,100 +151,59 @@ def parse_single_short_url(url):
         return url
 
 
-# 从链接中提取VID
 def extract_vid_from_link(link):
     match = VID_PATTERN.search(link)
     return match.group(1) if match else ""
 
 
-# ====================== 【核心优化】导出带居中对齐的XLSX Excel文件 ======================
+# 移除自动导出Excel，只保留手动导出
 def auto_export_excel(data):
-    # 生成带时间戳的文件名，避免覆盖
-    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"TikTok投流数据_{now_str}.xlsx"
+    pass
 
-    # 优先保存到桌面，无权限则保存到我的文档
+
+# ====================== 新增：网络检测/地区限制 ======================
+REGION_MAP = {
+    "CN": "中国大陆",
+    "HK": "中国香港",
+    "TW": "中国台湾",
+    "MO": "中国澳门"
+}
+FORBID_REGIONS = {"CN", "HK"}
+
+
+def get_current_ip():
     try:
-        save_path = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.access(save_path, os.W_OK):
-            save_path = os.path.join(os.path.expanduser("~"), "Documents")
-        full_file_path = os.path.join(save_path, file_name)
+        return urllib.request.urlopen("https://api.ipify.org", timeout=3).read().decode().strip()
     except:
-        full_file_path = os.path.join(os.path.abspath("."), file_name)
+        return None
 
-    # 定义表头
-    headers = ["日期", "ID", "产品名称", "链接", "VID", "code"]
 
-    # 创建Excel工作簿和工作表
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "TikTok投流数据"
-
-    # 定义样式
-    # 表头样式：加粗、水平垂直居中、浅灰色背景
-    header_font = Font(bold=True, name="微软雅黑", size=11)
-    header_fill = PatternFill("solid", fgColor="D3D3D3")
-    center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    # 数据行样式：水平垂直居中、自动换行
-    data_font = Font(name="微软雅黑", size=10)
-
-    # 写入表头
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = header_font
-        cell.alignment = center_alignment
-        cell.fill = header_fill
-
-    # 写入数据行，全部居中对齐
-    for row_idx, row_data in enumerate(data, 2):
-        for col_idx, cell_value in enumerate(row_data, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
-            cell.font = data_font
-            cell.alignment = center_alignment
-
-    # 自动适配列宽
-    for col_idx in range(1, len(headers) + 1):
-        col_letter = get_column_letter(col_idx)
-        max_content_width = 0
-        for cell in ws[col_letter]:
-            try:
-                cell_content = str(cell.value)
-                if len(cell_content) > max_content_width:
-                    max_content_width = len(cell_content)
-            except:
-                continue
-        # 列宽最小8，最大50，避免过宽
-        final_width = max(min(max_content_width + 3, 50), 8)
-        ws.column_dimensions[col_letter].width = final_width
-
-    # 冻结表头，滚动时固定
-    ws.freeze_panes = "A2"
-
-    # 保存Excel文件
-    wb.save(full_file_path)
-
-    # 自动用系统默认Excel/WPS程序打开文件
+def check_region():
+    ip, region, forbid = None, "未知地区", False
     try:
-        if os.name == "nt":  # Windows系统
-            os.startfile(full_file_path)
-        else:  # Mac/Linux系统
-            open_cmd = "open" if os.name == "posix" else "xdg-open"
-            subprocess.run([open_cmd, full_file_path], check=True)
+        resp = urllib.request.urlopen("https://ipinfo.io/json", timeout=3).read()
+        data = json.loads(resp)
+        ip = data.get("ip")
+        country = data.get("country")
+        region = REGION_MAP.get(country, "海外地区")
+        forbid = country in FORBID_REGIONS
     except:
-        pass  # 打开失败不中断流程
+        pass
+    return ip, region, forbid
 
-    return full_file_path
 
-
-# ====================== 核心解析：账号 + 多条3行产品 ======================
-def background_parse_task(text, callback):
+# ====================== 核心解析：完全保留你基准版的逻辑，不改！ ======================
+def background_parse_task(text, stop_flag, callback):
     raw_lines = [x.strip() for x in text.splitlines() if x.strip()]
     tasks = []
     idx = 0
     cur_account = None
 
     while idx < len(raw_lines):
+        if stop_flag.is_set():
+            callback([], "⏹️ 解析已停止")
+            return
+
         line = raw_lines[idx]
         # 新账号判定：后面至少3行：产品、链接、投流码
         if idx + 2 < len(raw_lines) and TIKTOK_SHORT_PATTERN.match(raw_lines[idx + 2]) and ADS_CODE_PATTERN.match(
@@ -253,6 +212,9 @@ def background_parse_task(text, callback):
             idx += 1
             # 循环读取该账号下所有产品(每组3行)
             while idx + 2 < len(raw_lines):
+                if stop_flag.is_set():
+                    callback([], "⏹️ 解析已停止")
+                    return
                 p = raw_lines[idx]
                 u = raw_lines[idx + 1]
                 a = raw_lines[idx + 2]
@@ -269,21 +231,21 @@ def background_parse_task(text, callback):
         return
 
     res = []
-    day = get_us_date()
+    day = get_beijing_date()
     with ThreadPoolExecutor(5) as pool:
         future_map = {pool.submit(parse_single_short_url, t[2]): t for t in tasks}
         for future in as_completed(future_map):
+            if stop_flag.is_set():
+                callback([], "⏹️ 解析已停止")
+                return
             acc, mod, link, adcode = future_map[future]
             final_link = future.result()
-            # 提取VID
             vid = extract_vid_from_link(final_link)
-            # 行数据：日期、ID、产品名称、链接、VID、code
             row = [day, acc, mod, final_link, vid, adcode]
             res.append(row)
 
-    # 自动导出+打开
-    excel_file_path = auto_export_excel(res)
-    msg = f"✅ 成功解析 {len(res)} 条\nExcel文件已自动保存并打开：\n{excel_file_path}"
+    # 不自动导出，只提示
+    msg = f"✅ 成功解析 {len(res)} 条"
     callback(res, msg)
 
 
@@ -292,7 +254,7 @@ class TikTokToolGUI:
         self.root = root
         self.auth_mgr = auth_mgr
         self.root.title(APP_TITLE)
-        self.root.geometry("900x650")
+        self.root.geometry("900x700")
 
         try:
             self.root.iconbitmap(APP_ICON)
@@ -300,8 +262,21 @@ class TikTokToolGUI:
             pass
 
         self.table_data = []
+        self.stop_flag = threading.Event()
+        self.is_parsing = False
+        self.net_forbidden = False
+
         main = ttk.Frame(root)
         main.pack(fill="both", expand=1, padx=10, pady=10)
+
+        # 3. 新增：网络状态UI
+        net_frame = ttk.Frame(main)
+        net_frame.grid(row=0, column=0, sticky="ew", pady=2)
+        self.net_label = tk.StringVar(value="网络检测中...")
+        ttk.Label(net_frame, text="网络：").pack(side="left")
+        ttk.Label(net_frame, textvariable=self.net_label, foreground="blue").pack(side="left")
+        self.refresh_btn = ttk.Button(net_frame, text="刷新网络", command=self.refresh_network)
+        self.refresh_btn.pack(side="right")
 
         tip_text = "格式：ID → 产品名称+链接+code(可连续多组)，支持任意空行"
         ttk.Label(main, text=tip_text).grid(row=1, column=0, sticky="w")
@@ -312,21 +287,23 @@ class TikTokToolGUI:
         bf.grid(row=3, column=0, sticky="w")
         self.btn_run = ttk.Button(bf, text="一键解析", command=self.start)
         self.btn_run.pack(side="left", padx=5)
+
+        # 4. 新增：停止解析按钮
+        self.btn_stop = ttk.Button(bf, text="停止解析", command=self.stop_parse, state="disabled")
+        self.btn_stop.pack(side="left", padx=5)
+
         ttk.Button(bf, text="手动导出Excel", command=self.export_excel).pack(side="left", padx=5)
         ttk.Button(bf, text="清空", command=self.clear).pack(side="left", padx=5)
 
         ttk.Label(main, text=f"预览 | 授权：{auth_mgr.get_remain_days()}").grid(row=4, column=0, sticky="w")
-        # 列名对应新表头
         cols = ["date", "id", "product", "link", "vid", "code"]
         self.tree = ttk.Treeview(main, columns=cols, show="headings")
-        # 表头文字
         self.tree.heading("date", text="日期")
         self.tree.heading("id", text="ID")
         self.tree.heading("product", text="产品名称")
         self.tree.heading("link", text="链接")
         self.tree.heading("vid", text="VID")
         self.tree.heading("code", text="code")
-        # 列宽适配
         self.tree.column("date", width=80)
         self.tree.column("id", width=120)
         self.tree.column("product", width=120)
@@ -349,23 +326,70 @@ class TikTokToolGUI:
         main.grid_rowconfigure(5, weight=5)
         main.grid_columnconfigure(0, weight=1)
 
+        # 初始化网络检测 + 自动刷新
+        self.refresh_network()
+        self.start_auto_net_refresh()
+
+    # 3. 网络刷新 + 5. 地区限制
+    def refresh_network(self):
+        self.refresh_btn.config(state="disabled")
+        self.status.set("检测网络地区...")
+
+        def task():
+            ip, region, forbid = check_region()
+            self.net_forbidden = forbid
+            self.root.after(0, lambda: self.net_label.set(f"IP：{ip} | 地区：{region}"))
+            self.root.after(0, lambda: self.refresh_btn.config(state="normal"))
+            self.root.after(0, lambda: self.status.set("就绪"))
+            if forbid:
+                self.root.after(0, lambda: self.btn_run.config(state="disabled"))
+                self.root.after(0, lambda: messagebox.showwarning("限制", "❌ 中国大陆/香港网络禁止使用！"))
+            else:
+                self.root.after(0, lambda: self.btn_run.config(state="normal"))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def start_auto_net_refresh(self):
+        def loop():
+            while True:
+                time.sleep(5)
+                if not self.is_parsing:
+                    self.root.after(0, self.refresh_network)
+
+        threading.Thread(target=loop, daemon=True).start()
+
     def start(self):
+        if self.is_parsing or self.net_forbidden:
+            return
         s = self.txt.get("1.0", "end-1c")
         if not s.strip():
             messagebox.showwarning("提示", "请输入内容")
             return
+
+        self.is_parsing = True
+        self.stop_flag.clear()
         self.btn_run.config(state="disabled")
+        self.btn_stop.config(state="normal")
         self.status.set("解析中...")
 
         def cb(res, msg):
             self.table_data = res
             for i in self.tree.get_children(): self.tree.delete(i)
             for r in res: self.tree.insert("", "end", values=r)
-            self.status.set(msg.split("\n")[0])
+            self.status.set(msg)
             self.btn_run.config(state="normal")
-            messagebox.showinfo("完成", msg)
+            self.btn_stop.config(state="disabled")
+            self.is_parsing = False
+            if "⏹️" not in msg:
+                messagebox.showinfo("完成", msg)
 
-        threading.Thread(target=background_parse_task, args=(s, cb), daemon=1).start()
+        # 完全用你基准版的解析函数
+        threading.Thread(target=background_parse_task, args=(s, self.stop_flag, cb), daemon=1).start()
+
+    # 4. 停止解析功能
+    def stop_parse(self):
+        self.stop_flag.set()
+        self.status.set("正在停止...")
 
     def export_excel(self):
         if not self.table_data:
@@ -373,49 +397,39 @@ class TikTokToolGUI:
             return
         p = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel文件", "*.xlsx")])
         if not p: return
-        # 手动导出也使用带格式的Excel
         headers = ["日期", "ID", "产品名称", "链接", "VID", "code"]
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "TikTok投流数据"
-
-        # 样式
         header_font = Font(bold=True, name="微软雅黑", size=11)
         header_fill = PatternFill("solid", fgColor="D3D3D3")
         center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         data_font = Font(name="微软雅黑", size=10)
 
-        # 写入表头
         for col_idx, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col_idx, value=header)
             cell.font = header_font
             cell.alignment = center_alignment
             cell.fill = header_fill
 
-        # 写入数据
         for row_idx, row_data in enumerate(self.table_data, 2):
             for col_idx, cell_value in enumerate(row_data, 1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
                 cell.font = data_font
                 cell.alignment = center_alignment
 
-        # 适配列宽
         for col_idx in range(1, len(headers) + 1):
             col_letter = get_column_letter(col_idx)
-            max_content_width = 0
+            max_w = 0
             for cell in ws[col_letter]:
                 try:
-                    cell_content = str(cell.value)
-                    if len(cell_content) > max_content_width:
-                        max_content_width = len(cell_content)
+                    max_w = max(max_w, len(str(cell.value)))
                 except:
-                    continue
-            final_width = max(min(max_content_width + 3, 50), 8)
-            ws.column_dimensions[col_letter].width = final_width
-
+                    pass
+            ws.column_dimensions[col_letter].width = max(min(max_w + 3, 50), 8)
         ws.freeze_panes = "A2"
         wb.save(p)
-        messagebox.showinfo("成功", f"Excel已导出到：{p}")
+        messagebox.showinfo("成功", f"导出完成：{p}")
 
     def clear(self):
         self.txt.delete("1.0", "end")
@@ -439,4 +453,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import time
+
     main()
