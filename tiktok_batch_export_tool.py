@@ -1,7 +1,8 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import re
-import urllib.request
+import httpx
+import asyncio
 import ssl
 import threading
 import webbrowser
@@ -31,7 +32,7 @@ APP_ICON = resource_path("logo.ico")
 AUTH_FILE = os.path.join(os.path.expanduser("~"), ".tiktok_ads_auth.dat")
 QQ_NUM = "349163112"
 WECHAT_ID = "CloudPark3000"
-APP_TITLE = "TikTok投流码专属自动化客户端 v1.0"  # 1. 加版本号
+APP_TITLE = "TikTok投流解析导出飞书工具 v1.0"  # 1. 加版本号
 
 
 class AuthManager:
@@ -132,7 +133,6 @@ class ActivateWindow(tk.Toplevel):
 
 
 ssl._create_default_https_context = ssl._create_unverified_context
-HEADERS = {"User-Agent": "Mozilla/5.0"}
 TIKTOK_SHORT_PATTERN = re.compile(r"https://www\.tiktok\.com/t/\S+")
 ADS_CODE_PATTERN = re.compile(r"#[\w/=+]+")
 VID_PATTERN = re.compile(r'/video/(\d+)')
@@ -141,15 +141,6 @@ VID_PATTERN = re.compile(r'/video/(\d+)')
 # 2. 日期改为北京时间
 def get_beijing_date():
     return datetime.now().strftime("%Y/%m/%d")
-
-
-def parse_single_short_url(url):
-    try:
-        resp = urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=5)
-        return resp.geturl().split("?")[0]
-    except:
-        return url
-
 
 def extract_vid_from_link(link):
     match = VID_PATTERN.search(link)
@@ -161,7 +152,15 @@ def auto_export_excel(data):
     pass
 
 
-# ====================== 新增：网络检测/地区限制 ======================
+# 全局异步HTTP客户端，复用连接池
+client = httpx.Client(
+    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+    timeout=1.0,  # 1秒超时，快速失败
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50)
+)
+
+# ====================== 网络检测/地区限制（修复版） ======================
 REGION_MAP = {
     "CN": "中国大陆",
     "HK": "中国香港",
@@ -170,83 +169,119 @@ REGION_MAP = {
 }
 FORBID_REGIONS = {"CN", "HK"}
 
-
 def get_current_ip():
     try:
-        return urllib.request.urlopen("https://api.ipify.org", timeout=3).read().decode().strip()
+        # 改用httpx请求，和全局客户端复用配置
+        resp = client.get("https://api.ipify.org", timeout=3)
+        return resp.text.strip()
     except:
         return None
-
 
 def check_region():
     ip, region, forbid = None, "未知地区", False
     try:
-        resp = urllib.request.urlopen("https://ipinfo.io/json", timeout=3).read()
-        data = json.loads(resp)
+        # 主接口
+        resp = client.get("https://ipinfo.io/json", timeout=3)
+        data = resp.json()
         ip = data.get("ip")
         country = data.get("country")
-        region = REGION_MAP.get(country, "海外地区")
-        forbid = country in FORBID_REGIONS
     except:
-        pass
+        try:
+            # 备用接口
+            resp = client.get("https://api.myip.com", timeout=3)
+            data = resp.json()
+            ip = data.get("ip")
+            country = data.get("country_code")
+        except:
+            return ip, region, forbid
+    region = REGION_MAP.get(country, "海外地区")
+    forbid = country in FORBID_REGIONS
     return ip, region, forbid
 
 
-# ====================== 核心解析：完全保留你基准版的逻辑，不改！ ======================
-def background_parse_task(text, stop_flag, callback):
-    raw_lines = [x.strip() for x in text.splitlines() if x.strip()]
-    tasks = []
-    idx = 0
-    cur_account = None
+# 全局缓存，避免重复请求
+url_cache = {}
 
-    while idx < len(raw_lines):
+def parse_single_short_url(url):
+    if url in url_cache:
+        return url_cache[url]
+    try:
+        resp = client.head(url)  # 用HEAD请求，比GET快一倍
+        final_url = str(resp.url).split("?")[0]
+        url_cache[url] = final_url
+        return final_url
+    except:
+        try:
+            resp = client.get(url)
+            final_url = str(resp.url).split("?")[0]
+            url_cache[url] = final_url
+            return final_url
+        except:
+            url_cache[url] = url
+            return url
+
+# 替换background_parse_task为异步并发版本
+def background_parse_task(text, stop_flag, callback):
+    start_time = time.time()
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    tasks = []
+    index = 0
+    current_account = None
+    total_lines = len(raw_lines)
+
+    # 快速提取数据
+    while index < total_lines:
         if stop_flag.is_set():
-            callback([], "⏹️ 解析已停止")
+            cost = round(time.time() - start_time, 2)
+            callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
             return
 
-        line = raw_lines[idx]
-        # 新账号判定：后面至少3行：产品、链接、投流码
-        if idx + 2 < len(raw_lines) and TIKTOK_SHORT_PATTERN.match(raw_lines[idx + 2]) and ADS_CODE_PATTERN.match(
-                raw_lines[idx + 3]):
-            cur_account = line
-            idx += 1
-            # 循环读取该账号下所有产品(每组3行)
-            while idx + 2 < len(raw_lines):
+        line = raw_lines[index]
+        if index + 3 <= total_lines and TIKTOK_SHORT_PATTERN.match(raw_lines[index+2]) and ADS_CODE_PATTERN.match(raw_lines[index+3]):
+            current_account = line
+            index += 1
+            while index + 2 <= total_lines:
                 if stop_flag.is_set():
-                    callback([], "⏹️ 解析已停止")
+                    cost = round(time.time() - start_time, 2)
+                    callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
                     return
-                p = raw_lines[idx]
-                u = raw_lines[idx + 1]
-                a = raw_lines[idx + 2]
-                if TIKTOK_SHORT_PATTERN.match(u) and ADS_CODE_PATTERN.match(a):
-                    tasks.append((cur_account, p, u, a))
-                    idx += 3
+                prod = raw_lines[index]
+                url = raw_lines[index+1]
+                code = raw_lines[index+2]
+                if TIKTOK_SHORT_PATTERN.match(url) and ADS_CODE_PATTERN.match(code):
+                    tasks.append((current_account, prod, url, code))
+                    index += 3
                 else:
                     break
-        else:
-            idx += 1
+            continue
+        index += 1
 
     if not tasks:
-        callback([], "❌ 未识别有效数据")
+        cost = round(time.time() - start_time, 2)
+        callback([], f"❌ 未识别有效数据 | 耗时 {cost}s")
         return
 
-    res = []
-    day = get_beijing_date()
-    with ThreadPoolExecutor(5) as pool:
-        future_map = {pool.submit(parse_single_short_url, t[2]): t for t in tasks}
-        for future in as_completed(future_map):
-            if stop_flag.is_set():
-                callback([], "⏹️ 解析已停止")
-                return
-            acc, mod, link, adcode = future_map[future]
-            final_link = future.result()
-            vid = extract_vid_from_link(final_link)
-            row = [day, acc, mod, final_link, vid, adcode]
-            res.append(row)
+    # 用线程池执行，每个请求复用连接池
+    result = []
+    parse_date = get_beijing_date()
+    max_workers = min(16, len(tasks))  # 16线程足够，再多会被限流
 
-    # 不自动导出，只提示
-    msg = f"✅ 成功解析 {len(res)} 条"
-    callback(res, msg)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {executor.submit(parse_single_short_url, t[2]): t for t in tasks}
+        for future in as_completed(future_to_task):
+            if stop_flag.is_set():
+                cost = round(time.time() - start_time, 2)
+                callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
+                return
+
+            account, product, short_url, ad_code = future_to_task[future]
+            final_url = future.result()
+            vid = extract_vid_from_link(final_url)
+            result.append([parse_date, account, product, final_url, vid, ad_code])
+
+    cost = round(time.time() - start_time, 2)
+    msg = f"✅ 成功解析 {len(result)} 条 | 耗时 {cost}s"
+    callback(result, msg)
 
 
 class TikTokToolGUI:
@@ -285,7 +320,7 @@ class TikTokToolGUI:
 
         bf = ttk.Frame(main)
         bf.grid(row=3, column=0, sticky="w")
-        self.btn_run = ttk.Button(bf, text="一键解析", command=self.start)
+        self.btn_run = ttk.Button(bf, text="一键解析", command=self.start_parse)
         self.btn_run.pack(side="left", padx=5)
 
         # 4. 新增：停止解析按钮
@@ -294,6 +329,7 @@ class TikTokToolGUI:
 
         ttk.Button(bf, text="手动导出Excel", command=self.export_excel).pack(side="left", padx=5)
         ttk.Button(bf, text="清空", command=self.clear).pack(side="left", padx=5)
+        ttk.Button(bf, text="清空缓存", command=lambda: url_cache.clear()).pack(side="left", padx=5)
 
         ttk.Label(main, text=f"预览 | 授权：{auth_mgr.get_remain_days()}").grid(row=4, column=0, sticky="w")
         cols = ["date", "id", "product", "link", "vid", "code"]
@@ -328,7 +364,7 @@ class TikTokToolGUI:
 
         # 初始化网络检测 + 自动刷新
         self.refresh_network()
-        self.start_auto_net_refresh()
+        #self.start_auto_net_refresh()
 
     # 3. 网络刷新 + 5. 地区限制
     def refresh_network(self):
@@ -358,7 +394,7 @@ class TikTokToolGUI:
 
         threading.Thread(target=loop, daemon=True).start()
 
-    def start(self):
+    def start_parse(self):
         if self.is_parsing or self.net_forbidden:
             return
         s = self.txt.get("1.0", "end-1c")
@@ -374,22 +410,31 @@ class TikTokToolGUI:
 
         def cb(res, msg):
             self.table_data = res
-            for i in self.tree.get_children(): self.tree.delete(i)
-            for r in res: self.tree.insert("", "end", values=r)
-            self.status.set(msg)
+            for i in self.tree.get_children():
+                self.tree.delete(i)
+            for r in res:
+                self.tree.insert("", "end", values=r)
+            self.status.set(msg)  # 这里会自动显示 耗时xx秒
             self.btn_run.config(state="normal")
             self.btn_stop.config(state="disabled")
             self.is_parsing = False
-            if "⏹️" not in msg:
-                messagebox.showinfo("完成", msg)
 
-        # 完全用你基准版的解析函数
-        threading.Thread(target=background_parse_task, args=(s, self.stop_flag, cb), daemon=1).start()
+        self.parse_thread = threading.Thread(
+            target=background_parse_task,
+            args=(s, self.stop_flag, cb),
+            daemon=True
+        )
+        self.parse_thread.start()
 
     # 4. 停止解析功能
     def stop_parse(self):
+        if not self.is_parsing:
+            return
         self.stop_flag.set()
         self.status.set("正在停止...")
+        # 等待线程结束（可选，增强稳定性）
+        if self.parse_thread and self.parse_thread.is_alive():
+            self.parse_thread.join(timeout=2)
 
     def export_excel(self):
         if not self.table_data:
@@ -449,6 +494,12 @@ def main():
         ActivateWindow(root, am)
     else:
         TikTokToolGUI(root, am)
+    def on_closing():
+        client.close()  # 关闭httpx连接池
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+
     root.mainloop()
 
 
