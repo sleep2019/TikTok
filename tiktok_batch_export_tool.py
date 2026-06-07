@@ -347,6 +347,7 @@ class TikTokToolGUI:
         self.tree.column("vid", width=180)
         self.tree.column("code", width=200)
         self.tree.grid(row=5, column=0, sticky="nsew", pady=5)
+        self.last_refresh_time = 0
 
         sf = ttk.Frame(main)
         sf.grid(row=6, column=0, sticky="ew")
@@ -365,6 +366,18 @@ class TikTokToolGUI:
         # 初始化网络检测 + 自动刷新
         self.refresh_network()
         #self.start_auto_net_refresh()
+
+        # 窗口获得焦点时 → 自动刷新网络（切回来就刷新）
+        self.root.bind("<FocusIn>", self.on_window_focus)
+
+    def on_window_focus(self, event=None):
+        if self.is_parsing:
+            return
+        # 3秒内不重复刷新
+        if time.time() - self.last_refresh_time < 3:
+            return
+        self.last_refresh_time = time.time()
+        self.refresh_network()
 
     # 3. 网络刷新 + 5. 地区限制
     def refresh_network(self):
