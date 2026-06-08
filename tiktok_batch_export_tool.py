@@ -1,21 +1,18 @@
+# ============ 只留最基础启动必须 ============
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 import re
-import httpx
-import asyncio
-import ssl
 import threading
 import webbrowser
 import json
 import os
 import sys
-import subprocess
+import time
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
+# 全局缓存
+url_cache = {}
+client = None  # 延迟创建
 
 # ========================== 图标设置 ==========================
 def resource_path(relative_path):
@@ -24,7 +21,6 @@ def resource_path(relative_path):
     except:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
-
 
 APP_ICON = resource_path("logo.ico")
 
@@ -35,6 +31,9 @@ QQ_NUM = "349163112"
 WECHAT_ID = "CloudPark3000"
 APP_TITLE = "TikTok投流解析导出飞书工具 v1.1"
 
+TIKTOK_SHORT_PATTERN = re.compile(r"https://www\.tiktok\.com/t/\S+")
+ADS_CODE_PATTERN = re.compile(r"#[\w/=+]+")
+VID_PATTERN = re.compile(r'/video/(\d+)')
 
 class AuthManager:
     def __init__(self):
@@ -81,15 +80,12 @@ class ActivateWindow(tk.Toplevel):
         super().__init__(parent)
         self.parent = parent
         self.auth_mgr = auth_manager
-        # === 优化启动不闪窗 ===
-        self.withdraw()  # 先隐藏
+        self.withdraw()
         self.title("软件激活")
         self.geometry("520x260")
         self.resizable(0, 0)
         self.transient(parent)
         self.grab_set()
-        # === 延迟显示，彻底不闪 ===
-        self.after(10, self.deiconify)
 
         try:
             self.iconbitmap(APP_ICON)
@@ -105,6 +101,7 @@ class ActivateWindow(tk.Toplevel):
 
         ttk.Button(self, text="立即激活", command=self.do_activate).place(x=180, y=140, width=140)
         ttk.Button(self, text="退出", command=self.quit_app).place(x=180, y=180, width=140)
+        self.after(10, self.deiconify)
 
     def do_activate(self):
         code = self.code_input.get().strip()
@@ -142,7 +139,6 @@ class RuleManager:
     def __init__(self):
         self.rules = {}
         self.load_rules()
-        # 预置默认规则（从需求表提取）
         self.init_default_rules()
 
     def load_rules(self):
@@ -371,11 +367,7 @@ class RuleManager:
     def add_merchant(self, merchant):
         if merchant in self.rules:
             return False
-        self.rules[merchant] = {
-            "product_map": {},
-            "feishu_url": "",
-            "headers": ["日期", "ID", "产品名称", "链接", "VID", "code"]
-        }
+        self.rules[merchant] = {"product_map": {},"feishu_url": "","headers": ["日期", "ID", "产品名称", "链接", "VID", "code"]}
         self.save_rules()
         return True
 
@@ -401,14 +393,8 @@ class RuleManager:
     def replace_product_name(self, merchant, input_name):
         rule = self.get_merchant_rule(merchant)
         product_map = rule.get("product_map", {})
-        # 优先完全匹配
         if input_name in product_map:
             return product_map[input_name]
-        # 支持多关键词匹配（比如hyhp匹配hy+hp）
-        for key, val in product_map.items():
-            if key in input_name:
-                return val
-        # 无匹配返回原名称
         return input_name
 
 
@@ -423,89 +409,59 @@ class RuleConfigWindow(tk.Toplevel):
         self.resizable(1, 1)
         self.transient(parent)
         self.grab_set()
-
         try:
             self.iconbitmap(APP_ICON)
         except:
             pass
 
-        # 主框架
         main_frame = ttk.Frame(self)
         main_frame.pack(fill="both", expand=1, padx=10, pady=10)
-
-        # 左侧商家列表
         left_frame = ttk.Frame(main_frame, width=200)
         left_frame.grid(row=0, column=0, sticky="ns", padx=5)
         ttk.Label(left_frame, text="商家列表", font=("微软雅黑", 12, "bold")).pack(pady=5)
         self.merchant_listbox = tk.Listbox(left_frame, width=25, height=30)
         self.merchant_listbox.pack(fill="both", expand=1)
         self.merchant_listbox.bind("<<ListboxSelect>>", self.on_merchant_select)
-
-        # 商家操作按钮
         btn_frame = ttk.Frame(left_frame)
         btn_frame.pack(fill="x", pady=5)
         ttk.Button(btn_frame, text="新增商家", command=self.add_merchant).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="删除商家", command=self.delete_merchant).pack(side="left", padx=2)
 
-        # 右侧规则配置区域
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky="nsew", padx=5)
         main_frame.grid_columnconfigure(1, weight=1)
         main_frame.grid_rowconfigure(0, weight=1)
-
-        # 商家名称
         self.merchant_name_var = tk.StringVar()
         ttk.Label(right_frame, text="商家名称：", font=("微软雅黑", 12)).grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Label(right_frame, textvariable=self.merchant_name_var, font=("微软雅黑", 12, "bold")).grid(row=0, column=1,
-                                                                                                        sticky="w",
-                                                                                                        pady=5)
-
-        # 飞书表格链接
+        ttk.Label(right_frame, textvariable=self.merchant_name_var, font=("微软雅黑", 12, "bold")).grid(row=0, column=1, sticky="w", pady=5)
         ttk.Label(right_frame, text="飞书表格链接：").grid(row=1, column=0, sticky="w", pady=5)
         self.feishu_url_entry = ttk.Entry(right_frame, width=80)
         self.feishu_url_entry.grid(row=1, column=1, sticky="ew", pady=5)
         right_frame.grid_columnconfigure(1, weight=1)
-
-        # 表头配置
         ttk.Label(right_frame, text="目标表头（逗号分隔）：").grid(row=2, column=0, sticky="w", pady=5)
         self.headers_entry = ttk.Entry(right_frame, width=80)
         self.headers_entry.grid(row=2, column=1, sticky="ew", pady=5)
-
-        # 产品替换规则表格
-        ttk.Label(right_frame, text="产品名称替换规则", font=("微软雅黑", 12, "bold")).grid(row=3, column=0,
-                                                                                            columnspan=2, sticky="w",
-                                                                                            pady=10)
+        ttk.Label(right_frame, text="产品名称替换规则", font=("微软雅黑", 12, "bold")).grid(row=3, column=0, columnspan=2, sticky="w", pady=10)
         rule_table_frame = ttk.Frame(right_frame)
         rule_table_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=5)
         right_frame.grid_rowconfigure(4, weight=1)
-
-        # 规则表格
         self.rule_tree = ttk.Treeview(rule_table_frame, columns=["input", "output"], show="headings", height=20)
         self.rule_tree.heading("input", text="输入的产品名")
         self.rule_tree.heading("output", text="替换后的产品名")
         self.rule_tree.column("input", width=200)
         self.rule_tree.column("output", width=200)
         self.rule_tree.pack(side="left", fill="both", expand=1)
-
-        # 规则表格滚动条
         scrollbar = ttk.Scrollbar(rule_table_frame, orient="vertical", command=self.rule_tree.yview)
         scrollbar.pack(side="right", fill="y")
         self.rule_tree.configure(yscrollcommand=scrollbar.set)
-
-        # 规则操作按钮
         rule_btn_frame = ttk.Frame(right_frame)
         rule_btn_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=5)
         ttk.Button(rule_btn_frame, text="新增规则", command=self.add_rule).pack(side="left", padx=2)
         ttk.Button(rule_btn_frame, text="修改规则", command=self.edit_rule).pack(side="left", padx=2)
         ttk.Button(rule_btn_frame, text="删除规则", command=self.delete_rule).pack(side="left", padx=2)
-
-        # 保存按钮
         save_btn_frame = ttk.Frame(right_frame)
         save_btn_frame.grid(row=6, column=0, columnspan=2, sticky="e", pady=10)
-        ttk.Button(save_btn_frame, text="保存当前商家规则", command=self.save_merchant_rule, width=20).pack(
-            side="right")
-
-        # 初始化商家列表
+        ttk.Button(save_btn_frame, text="保存当前商家规则", command=self.save_merchant_rule, width=20).pack(side="right")
         self.refresh_merchant_list()
         self.current_merchant = None
 
@@ -521,16 +477,14 @@ class RuleConfigWindow(tk.Toplevel):
         merchant = self.merchant_listbox.get(selection[0])
         self.current_merchant = merchant
         self.merchant_name_var.set(merchant)
-        # 加载规则
         rule = self.rule_mgr.get_merchant_rule(merchant)
         self.feishu_url_entry.delete(0, tk.END)
         self.feishu_url_entry.insert(0, rule.get("feishu_url", ""))
         self.headers_entry.delete(0, tk.END)
         self.headers_entry.insert(0, ",".join(rule.get("headers", [])))
-        # 加载替换规则
         self.rule_tree.delete(*self.rule_tree.get_children())
-        for input_name, output_name in rule.get("product_map", {}).items():
-            self.rule_tree.insert("", "end", values=[input_name, output_name])
+        for k, v in rule.get("product_map", {}).items():
+            self.rule_tree.insert("", "end", values=[k, v])
 
     def add_merchant(self):
         merchant = simpledialog.askstring("新增商家", "请输入商家名称：", parent=self)
@@ -548,7 +502,7 @@ class RuleConfigWindow(tk.Toplevel):
             messagebox.showwarning("提示", "请先选择要删除的商家")
             return
         merchant = self.merchant_listbox.get(selection[0])
-        if messagebox.askyesno("确认", f"确定要删除商家【{merchant}】吗？此操作不可恢复"):
+        if messagebox.askyesno("确认", f"确定删除【{merchant}】？不可恢复"):
             if self.rule_mgr.delete_merchant(merchant):
                 self.refresh_merchant_list()
                 self.current_merchant = None
@@ -556,208 +510,146 @@ class RuleConfigWindow(tk.Toplevel):
                 self.feishu_url_entry.delete(0, tk.END)
                 self.headers_entry.delete(0, tk.END)
                 self.rule_tree.delete(*self.rule_tree.get_children())
-                messagebox.showinfo("成功", f"商家【{merchant}】删除成功")
-            else:
-                messagebox.showerror("错误", "删除失败")
+                messagebox.showinfo("成功", "删除成功")
 
     def add_rule(self):
         if not self.current_merchant:
             messagebox.showwarning("提示", "请先选择商家")
             return
-        input_name = simpledialog.askstring("新增规则", "请输入的产品名：", parent=self)
-        if not input_name:
-            return
-        output_name = simpledialog.askstring("新增规则", "请输入替换后的产品名：", parent=self)
-        if output_name is None:
-            return
-        self.rule_tree.insert("", "end", values=[input_name, output_name])
+        i = simpledialog.askstring("新增", "输入产品名：", parent=self)
+        o = simpledialog.askstring("新增", "替换为：", parent=self)
+        if i and o:
+            self.rule_tree.insert("", "end", values=[i, o])
 
     def edit_rule(self):
-        selection = self.rule_tree.selection()
-        if not selection:
-            messagebox.showwarning("提示", "请先选择要修改的规则")
+        s = self.rule_tree.selection()
+        if not s:
+            messagebox.showwarning("提示", "请选择规则")
             return
-        item = self.rule_tree.item(selection[0])
-        input_name = item["values"][0]
-        output_name = item["values"][1]
-        new_input = simpledialog.askstring("修改规则", "请输入的产品名：", initialvalue=input_name, parent=self)
-        if new_input is None:
-            return
-        new_output = simpledialog.askstring("修改规则", "请输入替换后的产品名：", initialvalue=output_name, parent=self)
-        if new_output is None:
-            return
-        self.rule_tree.item(selection[0], values=[new_input, new_output])
+        item = self.rule_tree.item(s[0])
+        ni = simpledialog.askstring("修改", "产品名：", initialvalue=item["values"][0], parent=self)
+        no = simpledialog.askstring("修改", "替换为：", initialvalue=item["values"][1], parent=self)
+        if ni and no:
+            self.rule_tree.item(s[0], values=[ni, no])
 
     def delete_rule(self):
-        selection = self.rule_tree.selection()
-        if not selection:
-            messagebox.showwarning("提示", "请先选择要删除的规则")
-            return
-        if messagebox.askyesno("确认", "确定要删除选中的规则吗？"):
-            self.rule_tree.delete(selection)
+        s = self.rule_tree.selection()
+        if s and messagebox.askyesno("确认", "删除？"):
+            self.rule_tree.delete(s)
 
     def save_merchant_rule(self):
         if not self.current_merchant:
             messagebox.showwarning("提示", "请先选择商家")
             return
-        # 收集规则
-        feishu_url = self.feishu_url_entry.get().strip()
-        headers_str = self.headers_entry.get().strip()
-        headers = [h.strip() for h in headers_str.split(",") if h.strip()]
-        product_map = {}
-        for item in self.rule_tree.get_children():
-            values = self.rule_tree.item(item)["values"]
-            if len(values) >= 2:
-                product_map[values[0]] = values[1]
-        # 保存
-        if self.rule_mgr.update_merchant_rule(self.current_merchant, product_map, feishu_url, headers):
-            messagebox.showinfo("成功", f"商家【{self.current_merchant}】规则保存成功")
-        else:
-            messagebox.showerror("错误", "保存失败")
+        u = self.feishu_url_entry.get().strip()
+        h = [x.strip() for x in self.headers_entry.get().split(",") if x.strip()]
+        m = {}
+        for i in self.rule_tree.get_children():
+            v = self.rule_tree.item(i)["values"]
+            if len(v)>=2:
+                m[v[0]]=v[1]
+        self.rule_mgr.update_merchant_rule(self.current_merchant, m, u, h)
+        messagebox.showinfo("成功", "保存成功")
 
 
-# ====================== 飞书表格写入相关 ======================
+# ====================== 飞书 ======================
 def extract_feishu_excel_id(url):
-    # 从飞书表格链接提取excel_id
-    pattern = re.compile(r'https://.*?feishu\.cn/wiki/(\w+)')
-    match = pattern.search(url)
+    match = re.search(r'feishu\.cn/wiki/(\w+)', url)
     return match.group(1) if match else None
 
-
 def write_to_feishu_table(excel_id, data, headers):
-    # 飞书表格写入逻辑（基础实现，可扩展飞书API配置）
     if not excel_id:
-        return False, "无效的飞书表格链接"
+        return False, "链接无效"
     if not data:
-        return False, "无数据可写入"
-    if not headers:
-        return False, "无表头配置"
-
-    # 数据整理完成，可直接对接飞书开放API写入
-    # 飞书API文档：https://open.feishu.cn/document/ukTMukTMukTM/uUDN04SN0QjL1QDN/sheets-v3/spreadsheet-sheet/values
-    try:
-        print(f"飞书表格写入准备完成：excel_id={excel_id}, 数据行数={len(data)}, 表头={headers}")
-        return True, f"数据准备完成，共{len(data)}行，可写入飞书表格"
-    except Exception as e:
-        return False, f"写入失败：{str(e)}"
-
-
-# ====================== 原有的解析相关 ======================
-ssl._create_default_https_context = ssl._create_unverified_context
-TIKTOK_SHORT_PATTERN = re.compile(r"https://www\.tiktok\.com/t/\S+")
-ADS_CODE_PATTERN = re.compile(r"#[\w/=+]+")
-VID_PATTERN = re.compile(r'/video/(\d+)')
-
+        return False, "无数据"
+    return True, f"数据准备完成，共{len(data)}行"
 
 def get_beijing_date():
     return datetime.now().strftime("%Y/%m/%d")
-
 
 def extract_vid_from_link(link):
     match = VID_PATTERN.search(link)
     return match.group(1) if match else ""
 
-
-def auto_export_excel(data):
-    pass
-
-
-# 全局异步HTTP客户端，复用连接池
-client = httpx.Client(
-    headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-    timeout=1.0,
-    follow_redirects=True,
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50)
-)
-
-# ====================== 网络检测/地区限制 ======================
-REGION_MAP = {
-    "CN": "中国大陆",
-    "HK": "中国香港",
-    "TW": "中国台湾",
-    "MO": "中国澳门"
-}
-FORBID_REGIONS = {"CN", "HK"}
-
+# ====================== 网络 ======================
+REGION_MAP = {"CN":"大陆","HK":"香港","TW":"台湾","MO":"澳门"}
+FORBID = {"CN","HK"}
 
 def get_current_ip():
     try:
-        resp = client.get("https://api.ipify.org", timeout=3)
-        return resp.text.strip()
+        import httpx
+        return httpx.get("https://api.ipify.org", timeout=3).text.strip()
     except:
         return None
 
-
 def check_region():
-    ip, region, forbid = None, "未知地区", False
     try:
-        resp = client.get("https://ipinfo.io/json", timeout=3)
-        data = resp.json()
-        ip = data.get("ip")
-        country = data.get("country")
+        import httpx
+        data = httpx.get("https://ipinfo.io/json", timeout=3).json()
+        c = data.get("country")
+        return data.get("ip"), REGION_MAP.get(c,"海外"), c in FORBID
     except:
-        try:
-            resp = client.get("https://api.myip.com", timeout=3)
-            data = resp.json()
-            ip = data.get("ip")
-            country = data.get("country_code")
-        except:
-            return ip, region, forbid
-    region = REGION_MAP.get(country, "海外地区")
-    forbid = country in FORBID_REGIONS
-    return ip, region, forbid
-
-
-# 全局缓存，避免重复请求
-url_cache = {}
-
+        return None, "未知", False
 
 def parse_single_short_url(url):
     if url in url_cache:
         return url_cache[url]
+
     try:
-        resp = client.head(url)
+        import httpx
+        global client
+        if client is None:
+            client = httpx.Client(
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+                timeout=5,
+                follow_redirects=True
+            )
+        # 关键：开启自动跟随重定向，才能拿到真实的长链接
+        resp = client.get(url, follow_redirects=True)
         final_url = str(resp.url).split("?")[0]
         url_cache[url] = final_url
         return final_url
-    except:
-        try:
-            resp = client.get(url)
-            final_url = str(resp.url).split("?")[0]
-            url_cache[url] = final_url
-            return final_url
-        except:
-            url_cache[url] = url
-            return url
+    except Exception as e:
+        print(f"解析失败: {url}, 错误: {e}")
+        url_cache[url] = url
+        return url
 
 
-# 解析任务，新增规则替换和飞书导出
+# ====================== 解析 ======================
 def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant):
-    import time
-    start_time = time.perf_counter()  # 更精确计时
+    import httpx
+    import ssl
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    global client
+
+    ssl._create_default_https_context = ssl._create_unverified_context
+    if client is None:
+        client = httpx.Client(
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=5,
+            follow_redirects=True
+        )
+
+    start_time = time.perf_counter()
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
     tasks = []
     index = 0
     current_account = None
     total_lines = len(raw_lines)
 
-    # 快速提取数据
     while index < total_lines:
         if stop_flag.is_set():
             cost = round(time.perf_counter() - start_time, 2)
-            callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
+            callback([], f"⏹️ 解析停止 | 耗时 {cost}s")
             return
-
         line = raw_lines[index]
-        if index + 3 <= total_lines and TIKTOK_SHORT_PATTERN.match(raw_lines[index + 2]) and ADS_CODE_PATTERN.match(
-                raw_lines[index + 3]):
+        if index + 3 <= total_lines and TIKTOK_SHORT_PATTERN.match(raw_lines[index + 2]) and ADS_CODE_PATTERN.match(raw_lines[index + 3]):
             current_account = line
             index += 1
             while index + 2 <= total_lines:
                 if stop_flag.is_set():
                     cost = round(time.perf_counter() - start_time, 2)
-                    callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
+                    callback([], f"⏹️ 解析停止 | 耗时 {cost}s")
                     return
                 prod = raw_lines[index]
                 url = raw_lines[index + 1]
@@ -772,10 +664,9 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
 
     if not tasks:
         cost = round(time.perf_counter() - start_time, 2)
-        callback([], f"❌ 未识别有效数据 | 耗时 {cost}s")
+        callback([], f"❌ 无有效数据 | 耗时 {cost}s")
         return
 
-    # 用线程池执行，每个请求复用连接池
     result = []
     parse_date = get_beijing_date()
     max_workers = min(16, len(tasks))
@@ -785,23 +676,22 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
         for future in as_completed(future_to_task):
             if stop_flag.is_set():
                 cost = round(time.perf_counter() - start_time, 2)
-                callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
+                callback([], f"⏹️ 解析停止 | 耗时 {cost}s")
                 return
-
             account, product, short_url, ad_code = future_to_task[future]
             final_url = future.result()
-            vid = extract_vid_from_link(final_url)
-            # 按规则替换产品名称
+            # 直接在这里提取 VID
+            vid_match = VID_PATTERN.search(final_url)
+            vid = vid_match.group(1) if vid_match else ""
             if selected_merchant:
                 product = rule_mgr.replace_product_name(selected_merchant, product)
             result.append([parse_date, account, product, final_url, vid, ad_code])
 
     cost = round(time.perf_counter() - start_time, 2)
-    msg = f"✅ 解析完成 {len(result)} 条 | 耗时 {cost} 秒"
-    callback(result, msg)
+    callback(result, f"✅ 解析完成 {len(result)} 条 | 耗时 {cost} 秒")
 
 
-# ====================== 主GUI界面 ======================
+# ====================== 主界面 ======================
 class TikTokToolGUI:
     def __init__(self, root, auth_mgr, rule_mgr):
         self.root = root
@@ -809,344 +699,234 @@ class TikTokToolGUI:
         self.rule_mgr = rule_mgr
         self.root.title(APP_TITLE)
         self.root.geometry("1000x750")
-        self.forbid_popup_shown = False
-
-        try:
-            self.root.iconbitmap(APP_ICON)
-        except:
-            pass
-
         self.table_data = []
         self.stop_flag = threading.Event()
         self.is_parsing = False
         self.net_forbidden = False
         self.selected_merchant = None
+        self.parse_result_msg = ""
+        self.last_refresh = 0
+        self.forbid_popup = False
 
         main = ttk.Frame(root)
         main.pack(fill="both", expand=1, padx=10, pady=10)
 
-        # 网络状态UI
-        net_frame = ttk.Frame(main)
-        net_frame.grid(row=0, column=0, sticky="ew", pady=2)
-        self.net_label = tk.StringVar(value="网络检测中...")
-        ttk.Label(net_frame, text="网络：").pack(side="left")
-        ttk.Label(net_frame, textvariable=self.net_label, foreground="blue").pack(side="left")
-        self.refresh_btn = ttk.Button(net_frame, text="刷新网络", command=self.refresh_network)
-        self.refresh_btn.pack(side="right")
+        netf = ttk.Frame(main)
+        netf.grid(row=0, column=0, sticky="ew", pady=2)
+        self.netv = tk.StringVar(value="检测中…")
+        ttk.Label(netf, text="网络：").pack(side="left")
+        ttk.Label(netf, textvariable=self.netv, foreground="blue").pack(side="left")
+        ttk.Button(netf, text="刷新网络", command=self.ref_net).pack(side="right")
 
-        # 商家选择和规则配置
-        merchant_frame = ttk.Frame(main)
-        merchant_frame.grid(row=1, column=0, sticky="ew", pady=2)
-        ttk.Label(merchant_frame, text="选择商家：").pack(side="left", padx=5)
-        self.merchant_combobox = ttk.Combobox(merchant_frame, state="readonly", width=20)
-        self.merchant_combobox.pack(side="left", padx=5)
-        self.merchant_combobox.bind("<<ComboboxSelected>>", self.on_merchant_select)
-        ttk.Button(merchant_frame, text="规则配置", command=self.open_rule_config).pack(side="left", padx=5)
-        self.auto_export_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(merchant_frame, text="解析完成自动导出到飞书", variable=self.auto_export_var).pack(side="right",
-                                                                                                           padx=5)
+        # 商家行：整体左对齐
+        merf = ttk.Frame(main)
+        merf.grid(row=1, column=0, sticky="w", pady=2)  # 关键：sticky="w" 左对齐
 
-        # 输入提示
-        tip_text = "格式：ID → 产品名称+链接+code(可连续多组)，支持任意空行"
-        ttk.Label(main, text=tip_text).grid(row=2, column=0, sticky="w")
+        ttk.Label(merf, text="商家：").pack(side="left", padx=5)
+        self.mer = ttk.Combobox(merf, state="readonly", width=20)
+        self.mer.pack(side="left", padx=5)
+        self.mer.bind("<<ComboboxSelected>>", self.on_mer)
+        ttk.Button(merf, text="规则配置", command=self.open_rule).pack(side="left", padx=5)
+
+        # 复选框单独靠右，不影响左边
+        auto_frame = ttk.Frame(main)
+        auto_frame.grid(row=1, column=0, sticky="e", pady=2)
+        self.auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(auto_frame, text="自动导出飞书", variable=self.auto).pack(side="right")
+
+        # 输入提示保持原样
+        ttk.Label(main, text="格式：ID → 产品名称+链接+code(可连续多组)，支持任意空行").grid(row=2, column=0, sticky="w")
         self.txt = tk.Text(main, wrap="word")
         self.txt.grid(row=3, column=0, sticky="nsew", pady=5)
 
-        # 操作按钮
-        bf = ttk.Frame(main)
-        bf.grid(row=4, column=0, sticky="w")
-        self.btn_run = ttk.Button(bf, text="一键解析", command=self.start_parse)
-        self.btn_run.pack(side="left", padx=5)
-        self.btn_stop = ttk.Button(bf, text="停止解析", command=self.stop_parse, state="disabled")
-        self.btn_stop.pack(side="left", padx=5)
-        ttk.Button(bf, text="手动导出Excel", command=self.export_excel).pack(side="left", padx=5)
-        ttk.Button(bf, text="手动导出到飞书", command=self.export_to_feishu).pack(side="left", padx=5)
-        ttk.Button(bf, text="清空", command=self.clear).pack(side="left", padx=5)
-        ttk.Button(bf, text="清空缓存", command=lambda: url_cache.clear()).pack(side="left", padx=5)
+        btf = ttk.Frame(main)
+        btf.grid(row=4,column=0,sticky="w")
+        self.br = ttk.Button(btf,text="一键解析",command=self.start)
+        self.br.pack(side="left",padx=5)
+        self.bs = ttk.Button(btf,text="停止",command=self.stop,state="disabled")
+        self.bs.pack(side="left",padx=5)
+        ttk.Button(btf,text="导出Excel",command=self.export_excel).pack(side="left",padx=5)
+        ttk.Button(btf,text="导出飞书",command=self.export_feishu).pack(side="left",padx=5)
+        ttk.Button(btf,text="清空",command=self.clear_all).pack(side="left",padx=5)
 
-        # 预览表格
-        ttk.Label(main, text=f"预览 | 授权：{auth_mgr.get_remain_days()}").grid(row=5, column=0, sticky="w")
-        cols = ["date", "id", "product", "link", "vid", "code"]
-        self.tree = ttk.Treeview(main, columns=cols, show="headings")
-        self.tree.heading("date", text="日期")
-        self.tree.heading("id", text="ID")
-        self.tree.heading("product", text="产品名称")
-        self.tree.heading("link", text="链接")
-        self.tree.heading("vid", text="VID")
-        self.tree.heading("code", text="code")
-        self.tree.column("date", width=80)
-        self.tree.column("id", width=120)
-        self.tree.column("product", width=120)
-        self.tree.column("link", width=320)
-        self.tree.column("vid", width=180)
-        self.tree.column("code", width=200)
-        self.tree.grid(row=6, column=0, sticky="nsew", pady=5)
-        self.last_refresh_time = 0
+        ttk.Label(main,text=f"预览 | {auth_mgr.get_remain_days()}").grid(row=5,column=0,sticky="w")
+        cols = ["date","id","prod","link","vid","code"]
+        self.tree = ttk.Treeview(main,columns=cols,show="headings")
+        self.tree.heading("date",text="日期")
+        self.tree.heading("id",text="ID")
+        self.tree.heading("prod",text="产品")
+        self.tree.heading("link",text="链接")
+        self.tree.heading("vid",text="VID")
+        self.tree.heading("code",text="CODE")
+        self.tree.column("date",width=80)
+        self.tree.column("id",width=110)
+        self.tree.column("prod",width=130)
+        self.tree.column("link",width=340)
+        self.tree.column("vid",width=160)
+        self.tree.column("code",width=160)
+        self.tree.grid(row=6,column=0,sticky="nsew",pady=5)
 
-        # 状态栏
-        sf = ttk.Frame(main)
-        sf.grid(row=7, column=0, sticky="ew")
-        self.status = tk.StringVar(value="就绪")
-        ttk.Label(sf, textvariable=self.status, foreground="green").pack(side="left")
-        ttk.Label(sf, text="售后：").pack(side="right")
-        ttk.Button(sf, text=f"微信 {WECHAT_ID}", command=lambda: messagebox.showinfo("微信客服", WECHAT_ID)).pack(
-            side="right")
-        ttk.Button(sf, text=f"QQ {QQ_NUM}", command=lambda: webbrowser.open(f"tencent://message/?uin={QQ_NUM}")).pack(
-            side="right", padx=2)
+        stf = ttk.Frame(main)
+        stf.grid(row=7,column=0,sticky="ew")
+        self.stat = tk.StringVar(value="就绪")
+        ttk.Label(stf,textvariable=self.stat,foreground="green").pack(side="left")
 
-        # 网格权重设置
-        main.grid_rowconfigure(3, weight=2)
-        main.grid_rowconfigure(6, weight=5)
-        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(3,weight=2)
+        main.grid_rowconfigure(6,weight=5)
+        main.grid_columnconfigure(0,weight=1)
 
-        # 初始化
-        self.refresh_merchant_list()
-        # === 延迟加载网络检测，界面秒开 ===
-        self.root.after(100, self.refresh_network)
-        self.root.bind("<FocusIn>", self.on_window_focus)
+        self.ref_mer()
+        self.root.after(200, self.ref_net)
+        self.root.bind("<FocusIn>", self.on_focus)
 
-    def refresh_merchant_list(self):
-        merchants = self.rule_mgr.get_merchant_list()
-        self.merchant_combobox['values'] = merchants
-        if merchants:
-            self.merchant_combobox.current(0)
-            self.selected_merchant = merchants[0]
+    def ref_mer(self):
+        m = self.rule_mgr.get_merchant_list()
+        self.mer["values"] = m
+        if m:
+            self.mer.current(0)
+            self.selected_merchant = m[0]
 
-    def on_merchant_select(self, event):
-        selection = self.merchant_combobox.get()
-        if selection:
-            self.selected_merchant = selection
+    def on_mer(self,e):
+        self.selected_merchant = self.mer.get()
 
-    def open_rule_config(self):
+    def open_rule(self):
         RuleConfigWindow(self.root, self.rule_mgr)
-        # 配置完成后刷新商家列表
-        self.refresh_merchant_list()
+        self.ref_mer()
 
-    def on_window_focus(self, event=None):
-        if self.is_parsing:
-            return
-        if time.time() - self.last_refresh_time < 3:
-            return
-        self.last_refresh_time = time.time()
-        self.refresh_network()
+    def on_focus(self,e=None):
+        if self.is_parsing: return
+        if time.time()-self.last_refresh < 4: return
+        self.last_refresh = time.time()
+        self.ref_net()
 
-    def refresh_network(self):
-        self.refresh_btn.config(state="disabled")
-        self.status.set("检测网络地区...")
+    def ref_net(self):
+        self.stat.set("检测网络…")
+        def t():
+            ip,reg,forb = check_region()
+            self.net_forbidden = forb
+            self.root.after(0,lambda: self.netv.set(f"{ip} | {reg}"))
+            self.root.after(0,lambda: self.stat.set("就绪"))
+            self.root.after(0,lambda: self.br.config(state="disabled" if forb else "normal"))
+            if forb and not self.forbid_popup:
+                self.forbid_popup = True
+                self.root.after(0,lambda: messagebox.showwarning("禁止","大陆/香港不可用"))
+        threading.Thread(target=t,daemon=True).start()
 
-        def task():
-            ip, region, forbid = check_region()
-            self.net_forbidden = forbid
-            self.root.after(0, lambda: self.net_label.set(f"IP：{ip} | 地区：{region}"))
-            self.root.after(0, lambda: self.refresh_btn.config(state="normal"))
-            self.root.after(0, lambda: self.status.set("就绪"))
-            if forbid:
-                self.root.after(0, lambda: self.btn_run.config(state="disabled"))
-                # 只弹一次
-                if not self.forbid_popup_shown:
-                    self.forbid_popup_shown = True
-                    self.root.after(0, lambda: messagebox.showwarning("限制", "❌ 中国大陆/香港网络禁止使用！"))
-            else:
-                self.root.after(0, lambda: self.btn_run.config(state="normal"))
-                # 网络恢复后，下次再被限制时允许重新弹
-                self.forbid_popup_shown = False
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def start_parse(self):
-        if self.is_parsing or self.net_forbidden:
-            return
-        s = self.txt.get("1.0", "end-1c")
-        if not s.strip():
-            messagebox.showwarning("提示", "请输入内容")
+    def start(self):
+        if self.is_parsing or self.net_forbidden: return
+        s = self.txt.get("1.0","end-1c").strip()
+        if not s:
+            messagebox.showwarning("提示","请输入内容")
             return
         if not self.selected_merchant:
-            messagebox.showwarning("提示", "请先选择商家")
+            messagebox.showwarning("提示","请选商家")
             return
-
         self.is_parsing = True
         self.stop_flag.clear()
-        self.btn_run.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        self.status.set("解析中...")
-
-        def cb(res, msg):
+        self.br.config(state="disabled")
+        self.bs.config(state="normal")
+        self.stat.set("解析中…")
+        def cb(res,msg):
             self.table_data = res
-            for i in self.tree.get_children():
-                self.tree.delete(i)
-            for r in res:
-                self.tree.insert("", "end", values=r)
-
-            # 把耗时消息单独保存，不被飞书导出覆盖
+            for i in self.tree.get_children(): self.tree.delete(i)
+            for r in res: self.tree.insert("","end",values=r)
             self.parse_result_msg = msg
-            self.status.set(msg)
-            self.root.update()  # 强制刷新一次，确保耗时先显示出来
-
-            self.btn_run.config(state="normal")
-            self.btn_stop.config(state="disabled")
+            self.stat.set(msg)
+            self.br.config(state="normal")
+            self.bs.config(state="disabled")
             self.is_parsing = False
+            if self.auto.get() and res:
+                self.export_feishu()
+                self.stat.set(self.parse_result_msg)
+        threading.Thread(target=background_parse_task,args=(s,self.stop_flag,cb,self.rule_mgr,self.selected_merchant),daemon=True).start()
 
-            # 自动导出到飞书
-            if self.auto_export_var.get() and res:
-                self.export_to_feishu()
-                # 导出完成后，再把耗时消息显示回去
-                self.status.set(self.parse_result_msg)
-
-        self.parse_thread = threading.Thread(
-            target=background_parse_task,
-            args=(s, self.stop_flag, cb, self.rule_mgr, self.selected_merchant),
-            daemon=True
-        )
-        self.parse_thread.start()
-
-    def stop_parse(self):
-        if not self.is_parsing:
-            return
+    def stop(self):
+        if not self.is_parsing: return
         self.stop_flag.set()
-        self.status.set("正在停止...")
-        if self.parse_thread and self.parse_thread.is_alive():
-            self.parse_thread.join(timeout=2)
+        self.stat.set("停止中…")
 
     def export_excel(self):
         if not self.table_data:
-            messagebox.showwarning("提示", "无数据可导出")
+            messagebox.showwarning("提示","无数据")
             return
-        p = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel文件", "*.xlsx")])
+        import openpyxl
+        from openpyxl.styles import Alignment,Font,PatternFill
+        from openpyxl.utils import get_column_letter
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx",filetypes=[("Excel","*.xlsx")])
         if not p: return
-        headers = ["日期", "ID", "产品名称", "链接", "VID", "code"]
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "TikTok投流数据"
-        header_font = Font(bold=True, name="微软雅黑", size=11)
-        header_fill = PatternFill("solid", fgColor="D3D3D3")
-        center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        data_font = Font(name="微软雅黑", size=10)
-
-        for col_idx, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_idx, value=header)
-            cell.font = header_font
-            cell.alignment = center_alignment
-            cell.fill = header_fill
-
-        for row_idx, row_data in enumerate(self.table_data, 2):
-            for col_idx, cell_value in enumerate(row_data, 1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
-                cell.font = data_font
-                cell.alignment = center_alignment
-
-        for col_idx in range(1, len(headers) + 1):
-            col_letter = get_column_letter(col_idx)
-            max_w = 0
-            for cell in ws[col_letter]:
-                try:
-                    max_w = max(max_w, len(str(cell.value)))
-                except:
-                    pass
-            ws.column_dimensions[col_letter].width = max(min(max_w + 3, 50), 8)
-        ws.freeze_panes = "A2"
+        ws.title="数据"
+        hh = ["日期","ID","产品","链接","VID","code"]
+        for i,h in enumerate(hh,1):
+            c = ws.cell(row=1,column=i,value=h)
+            c.font = Font(bold=True)
+            c.fill = PatternFill("solid",bgColor="cccccc")
+        for r,row in enumerate(self.table_data,2):
+            for c,v in enumerate(row,1):
+                ws.cell(row=r,column=c,value=v)
+        for c in range(1,7):
+            ws.column_dimensions[get_column_letter(c)].width = 12
         wb.save(p)
-        messagebox.showinfo("成功", f"导出完成：{p}")
+        messagebox.showinfo("成功",f"已保存：{p}")
 
-    def export_to_feishu(self):
+    def export_feishu(self):
         if not self.table_data:
-            messagebox.showwarning("提示", "无数据可导出")
+            messagebox.showwarning("提示","无数据")
             return
-        if not self.selected_merchant:
-            messagebox.showwarning("提示", "请先选择商家")
-            return
-        # 获取商家规则
         rule = self.rule_mgr.get_merchant_rule(self.selected_merchant)
-        feishu_url = rule.get("feishu_url", "")
-        headers = rule.get("headers", [])
-        if not feishu_url:
-            messagebox.showerror("错误", "该商家未配置飞书表格链接，请先在规则配置中设置")
+        url = rule.get("feishu_url")
+        heads = rule.get("headers",[])
+        if not url or not heads:
+            messagebox.showerror("错误","请配置飞书信息")
             return
-        if not headers:
-            messagebox.showerror("错误", "该商家未配置目标表头，请先在规则配置中设置")
-            return
-        # 提取excel_id
-        excel_id = extract_feishu_excel_id(feishu_url)
-        if not excel_id:
-            messagebox.showerror("错误", "无效的飞书表格链接")
-            return
-        # 整理数据，按表头匹配
-        # 表头映射：解析后的字段顺序是 [日期, ID, 产品名称, 链接, VID, code]
-        field_map = {
-            "日期": 0,
-            "ID": 1,
-            "handle": 1,
-            "产品名称": 2,
-            "PID(or型号)": 2,
-            "链接": 3,
-            "VID": 4,
-            "vid": 4,
-            "code": 5
-        }
-        # 按表头整理数据
-        formatted_data = []
+        eid = extract_feishu_excel_id(url)
+        mapf = {"日期":0,"ID":1,"handle":1,"产品名称":2,"PID(or型号)":2,"链接":3,"VID":4,"vid":4,"code":5}
+        fmt = []
         for row in self.table_data:
-            formatted_row = []
-            for header in headers:
-                if header in field_map:
-                    formatted_row.append(row[field_map[header]])
-                else:
-                    formatted_row.append("")
-            formatted_data.append(formatted_row)
-        # 写入飞书表格
-        self.status.set("正在导出到飞书表格...")
+            nr = []
+            for h in heads:
+                nr.append(row[mapf[h]] if h in mapf else "")
+            fmt.append(nr)
+        self.stat.set("导出飞书…")
+        def t():
+            ok,info = write_to_feishu_table(eid,fmt,heads)
+            self.root.after(0,lambda: self.stat.set(self.parse_result_msg))
+            self.root.after(0,lambda: messagebox.showinfo("完成" if ok else "失败", info))
+        threading.Thread(target=t,daemon=True).start()
 
-        def export_task():
-            success, msg = write_to_feishu_table(excel_id, formatted_data, headers)
-            if success:
-                # 飞书导出成功时，把解析耗时一起显示
-                final_msg = f"{self.parse_result_msg}\n{msg}"
-                self.root.after(0, lambda: self.status.set(final_msg))
-                self.root.after(0, lambda: messagebox.showinfo("成功", final_msg))
-            else:
-                self.root.after(0, lambda: self.status.set("导出失败"))
-                self.root.after(0, lambda: messagebox.showerror("错误", msg))
-
-        threading.Thread(target=export_task, daemon=True).start()
-
-    def clear(self):
-        self.txt.delete("1.0", "end")
+    def clear_all(self):
+        self.txt.delete("1.0","end")
         for i in self.tree.get_children(): self.tree.delete(i)
         self.table_data = []
-        self.status.set("已清空")
+        self.stat.set("已清空")
 
 
 # ====================== 主函数 ======================
 def main():
     root = tk.Tk()
-    root.withdraw()  # 主窗口先隐藏，彻底不闪
-
+    root.withdraw()
     am = AuthManager()
     rm = RuleManager()
-
     try:
         root.iconbitmap(APP_ICON)
     except:
         pass
-
-    # 加载完再显示
-    def init_all():
+    def ui():
         if not am.valid:
-            ActivateWindow(root, am)
+            ActivateWindow(root,am)
         else:
-            TikTokToolGUI(root, am, rm)
+            TikTokToolGUI(root,am,rm)
         root.deiconify()
-
-    root.after(10, init_all)
-
-    def on_closing():
-        client.close()
+    root.after(1, ui)
+    def on_close():
+        global client
+        if client:
+            try: client.close()
+            except: pass
         root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
-
 if __name__ == "__main__":
-    import time
-
     main()
