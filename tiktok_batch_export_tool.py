@@ -81,11 +81,15 @@ class ActivateWindow(tk.Toplevel):
         super().__init__(parent)
         self.parent = parent
         self.auth_mgr = auth_manager
+        # === 优化启动不闪窗 ===
+        self.withdraw()  # 先隐藏
         self.title("软件激活")
         self.geometry("520x260")
         self.resizable(0, 0)
         self.transient(parent)
         self.grab_set()
+        # === 延迟显示，彻底不闪 ===
+        self.after(10, self.deiconify)
 
         try:
             self.iconbitmap(APP_ICON)
@@ -731,7 +735,7 @@ def parse_single_short_url(url):
 # 解析任务，新增规则替换和飞书导出
 def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant):
     import time
-    start_time = time.time()
+    start_time = time.perf_counter()  # 更精确计时
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
     tasks = []
     index = 0
@@ -741,7 +745,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
     # 快速提取数据
     while index < total_lines:
         if stop_flag.is_set():
-            cost = round(time.time() - start_time, 2)
+            cost = round(time.perf_counter() - start_time, 2)
             callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
             return
 
@@ -752,7 +756,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
             index += 1
             while index + 2 <= total_lines:
                 if stop_flag.is_set():
-                    cost = round(time.time() - start_time, 2)
+                    cost = round(time.perf_counter() - start_time, 2)
                     callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
                     return
                 prod = raw_lines[index]
@@ -767,7 +771,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
         index += 1
 
     if not tasks:
-        cost = round(time.time() - start_time, 2)
+        cost = round(time.perf_counter() - start_time, 2)
         callback([], f"❌ 未识别有效数据 | 耗时 {cost}s")
         return
 
@@ -780,7 +784,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
         future_to_task = {executor.submit(parse_single_short_url, t[2]): t for t in tasks}
         for future in as_completed(future_to_task):
             if stop_flag.is_set():
-                cost = round(time.time() - start_time, 2)
+                cost = round(time.perf_counter() - start_time, 2)
                 callback([], f"⏹️ 解析已停止 | 耗时 {cost}s")
                 return
 
@@ -792,8 +796,8 @@ def background_parse_task(text, stop_flag, callback, rule_mgr, selected_merchant
                 product = rule_mgr.replace_product_name(selected_merchant, product)
             result.append([parse_date, account, product, final_url, vid, ad_code])
 
-    cost = round(time.time() - start_time, 2)
-    msg = f"✅ 成功解析 {len(result)} 条 | 耗时 {cost}s"
+    cost = round(time.perf_counter() - start_time, 2)
+    msg = f"✅ 解析完成 {len(result)} 条 | 耗时 {cost} 秒"
     callback(result, msg)
 
 
@@ -897,7 +901,8 @@ class TikTokToolGUI:
 
         # 初始化
         self.refresh_merchant_list()
-        self.refresh_network()
+        # === 延迟加载网络检测，界面秒开 ===
+        self.root.after(100, self.refresh_network)
         self.root.bind("<FocusIn>", self.on_window_focus)
 
     def refresh_merchant_list(self):
@@ -971,13 +976,21 @@ class TikTokToolGUI:
                 self.tree.delete(i)
             for r in res:
                 self.tree.insert("", "end", values=r)
+
+            # 把耗时消息单独保存，不被飞书导出覆盖
+            self.parse_result_msg = msg
             self.status.set(msg)
+            self.root.update()  # 强制刷新一次，确保耗时先显示出来
+
             self.btn_run.config(state="normal")
             self.btn_stop.config(state="disabled")
             self.is_parsing = False
+
             # 自动导出到飞书
             if self.auto_export_var.get() and res:
                 self.export_to_feishu()
+                # 导出完成后，再把耗时消息显示回去
+                self.status.set(self.parse_result_msg)
 
         self.parse_thread = threading.Thread(
             target=background_parse_task,
@@ -1084,10 +1097,13 @@ class TikTokToolGUI:
 
         def export_task():
             success, msg = write_to_feishu_table(excel_id, formatted_data, headers)
-            self.root.after(0, lambda: self.status.set(msg if success else "导出失败"))
             if success:
-                self.root.after(0, lambda: messagebox.showinfo("成功", msg))
+                # 飞书导出成功时，把解析耗时一起显示
+                final_msg = f"{self.parse_result_msg}\n{msg}"
+                self.root.after(0, lambda: self.status.set(final_msg))
+                self.root.after(0, lambda: messagebox.showinfo("成功", final_msg))
             else:
+                self.root.after(0, lambda: self.status.set("导出失败"))
                 self.root.after(0, lambda: messagebox.showerror("错误", msg))
 
         threading.Thread(target=export_task, daemon=True).start()
@@ -1101,17 +1117,26 @@ class TikTokToolGUI:
 
 # ====================== 主函数 ======================
 def main():
+    root = tk.Tk()
+    root.withdraw()  # 主窗口先隐藏，彻底不闪
+
     am = AuthManager()
     rm = RuleManager()
-    root = tk.Tk()
+
     try:
         root.iconbitmap(APP_ICON)
     except:
         pass
-    if not am.valid:
-        ActivateWindow(root, am)
-    else:
-        TikTokToolGUI(root, am, rm)
+
+    # 加载完再显示
+    def init_all():
+        if not am.valid:
+            ActivateWindow(root, am)
+        else:
+            TikTokToolGUI(root, am, rm)
+        root.deiconify()
+
+    root.after(10, init_all)
 
     def on_closing():
         client.close()
