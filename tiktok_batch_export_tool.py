@@ -28,7 +28,7 @@ AUTH_FILE = os.path.join(os.path.expanduser("~"), ".tiktok_ads_auth.dat")
 RULE_FILE = os.path.join(os.path.expanduser("~"), ".tiktok_ads_rules.json")
 QQ_NUM = "349163112"
 WECHAT_ID = "CloudPark3000"
-APP_TITLE = "TikTok投流解析导出飞书工具 v1.1"
+APP_TITLE = "TikTok投流解析导出飞书工具 v1.2(2026-11-19)"
 
 TIKTOK_SHORT_PATTERN = re.compile(r"https://www\.tiktok\.com/t/\S+")
 ADS_CODE_PATTERN = re.compile(r"#[\w/=+]+")
@@ -153,7 +153,6 @@ class RuleManager:
     def save_rules(self):
         with open(RULE_FILE, "w", encoding="utf-8") as f:
             json.dump(self.rules, f, ensure_ascii=False, indent=2)
-        # 保存后重建全局映射
         self.build_global_map()
 
     def build_global_map(self):
@@ -313,6 +312,7 @@ class RuleManager:
 
 
 # ====================== 规则配置窗口 ======================
+# ====================== 规则配置窗口 ======================
 class RuleConfigWindow(tk.Toplevel):
     def __init__(self, parent, rule_manager):
         super().__init__(parent)
@@ -411,9 +411,15 @@ class RuleConfigWindow(tk.Toplevel):
                 # 取消：不关闭窗口
                 return
             elif ret is True:
-                # 保存，和保存按钮逻辑保持一致
+                # 保存
                 self.rule_mgr.update_merchant_rule(self.current_merchant, m, u, h)
                 self.parent.ref_mer()
+                edited_merchant = self.current_merchant
+                combobox = self.parent.mer
+                if edited_merchant in combobox["values"]:
+                    combobox.set(edited_merchant)
+                    self.parent.selected_merchant = edited_merchant
+                    self.parent.on_mer(None)
         # 无改动 / 选不保存：直接关闭
         self.destroy()
 
@@ -498,11 +504,20 @@ class RuleConfigWindow(tk.Toplevel):
         m = {}
         for i in self.rule_tree.get_children():
             v = self.rule_tree.item(i)["values"]
-            if len(v)>=2:
+            if len(v) >= 2:
                 m[v[0]] = v[1]
         self.rule_mgr.update_merchant_rule(self.current_merchant, m, u, h)
         messagebox.showinfo("成功", "保存成功")
+        edited_merchant = self.current_merchant
+        # 调用主界面刷新商家下拉列表
         self.parent.ref_mer()
+        combobox = self.parent.mer
+        if edited_merchant in combobox["values"]:
+            combobox.set(edited_merchant)
+            self.parent.selected_merchant = edited_merchant
+            self.parent.on_mer(None)
+
+
 
 
 # ====================== 飞书 & 工具函数 ======================
@@ -557,23 +572,43 @@ def check_region():
 def parse_single_short_url(url):
     if url in url_cache:
         return url_cache[url]
-    try:
-        import httpx
-        global client
-        if client is None:
-            client = httpx.Client(
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-                timeout=5,
-                follow_redirects=True
-            )
-        resp = client.get(url, follow_redirects=True)
-        final_url = str(resp.url).split("?")[0]
+
+    import httpx
+    global client
+    if client is None:
+        client = httpx.Client(
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=httpx.Timeout(connect=3.0, read=5.0, write=4.0, pool=8.0),
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=40, max_keepalive_connections=20)
+        )
+
+    max_retry = 3
+    final_url = None
+    for retry_times in range(max_retry):
+        try:
+            resp = client.get(url, follow_redirects=True)
+            final_url = str(resp.url).split("?")[0]
+            print(f"[跳转完成] {url} → {final_url}", flush=True)
+            break
+        except httpx.ReadTimeout:
+            print(f"[请求超时，重试{retry_times+1}/{max_retry}] {url}", flush=True)
+            time.sleep(0.2)
+            continue
+        except Exception as e:
+            print(f"[其他错误] {url} ：{e}", flush=True)
+            break
+
+    if final_url is not None:
         url_cache[url] = final_url
         return final_url
-    except Exception as e:
-        print(f"解析失败: {url}, 错误: {e}")
+    else:
+        print(f"[重试全部失败] {url}", flush=True)
         url_cache[url] = url
         return url
+
+
 
 
 # ====================== 解析核心（全局产品匹配） ======================
@@ -584,13 +619,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr):
     global client
 
     ssl._create_default_https_context = ssl._create_unverified_context
-    if client is None:
-        client = httpx.Client(
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-            timeout=5,
-            follow_redirects=True
-        )
-
+    # 删掉这里单独新建client！！parse_single_short_url里面会自动初始化全局client
     start_time = time.perf_counter()
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
     tasks = []
@@ -630,7 +659,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr):
 
     result = []
     parse_date = get_beijing_date()
-    max_workers = min(16, len(tasks))
+    max_workers = 12
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_task = {executor.submit(parse_single_short_url, t[2]): t for t in tasks}
@@ -653,6 +682,7 @@ def background_parse_task(text, stop_flag, callback, rule_mgr):
 
     cost = round(time.perf_counter() - start_time, 2)
     callback(result, f"✅ 解析完成 {len(result)} 条 | 耗时 {cost} 秒")
+
 
 
 # ====================== 主界面 ======================
@@ -761,6 +791,13 @@ class TikTokToolGUI:
     def open_rule(self):
         RuleConfigWindow(self.root, self.rule_mgr)
         self.ref_mer()
+
+    def refresh_current_merchant_config(self):
+        # 重新加载当前选中商家的配置
+        if self.selected_merchant:
+            rule = self.rule_mgr.get_merchant_rule(self.selected_merchant)
+            # 这里只是内存刷新，下拉文字不变，导出时会拿新规则
+            pass
 
     def on_focus(self,e=None):
         if self.is_parsing: return
@@ -899,7 +936,7 @@ class TikTokToolGUI:
         # 链接为空直接提示，不阻断；如果为空就不调用飞书接口
         if not url:
             messagebox.showinfo("提示", "当前商家飞书链接为空，跳过飞书推送")
-        return
+            return
         eid = extract_feishu_excel_id(url)
         # 修改后的代码
         field_index_map = {
