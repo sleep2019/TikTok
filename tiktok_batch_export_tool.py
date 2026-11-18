@@ -32,7 +32,7 @@ APP_TITLE = "TikTok投流解析导出飞书工具 v1.1"
 
 TIKTOK_SHORT_PATTERN = re.compile(r"https://www\.tiktok\.com/t/\S+")
 ADS_CODE_PATTERN = re.compile(r"#[\w/=+]+")
-VID_PATTERN = re.compile(r'/video/(\d+)')
+VID_PATTERN = re.compile(r'(?:/(video|photo)/(\d+)|[?&/]vid[=\/]([a-zA-Z0-9_-]+))')
 
 class AuthManager:
     def __init__(self):
@@ -327,6 +327,7 @@ class RuleConfigWindow(tk.Toplevel):
             self.iconbitmap(APP_ICON)
         except:
             pass
+        self.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
         main_frame = ttk.Frame(self)
         main_frame.pack(fill="both", expand=1, padx=10, pady=10)
@@ -378,6 +379,43 @@ class RuleConfigWindow(tk.Toplevel):
         ttk.Button(save_btn_frame, text="保存当前商家规则", command=self.save_merchant_rule, width=20).pack(side="right")
         self.refresh_merchant_list()
         self.current_merchant = None
+
+    def on_window_close(self):
+        # 先把界面上当前表单的值读出来，和后台原始规则对比
+        if not self.current_merchant:
+            # 没选中商家，直接关
+            self.destroy()
+            return
+
+        # 读取界面上现在的内容
+        u = self.feishu_url_entry.get().strip()
+        h = [x.strip() for x in self.headers_entry.get().split(",") if x.strip()]
+        m = {}
+        for i in self.rule_tree.get_children():
+            v = self.rule_tree.item(i)["values"]
+            if len(v) >= 2:
+                m[v[0]] = v[1]
+
+        # 拿到原始规则
+        origin_rule = self.rule_mgr.get_merchant_rule(self.current_merchant)
+        origin_u = origin_rule.get("feishu_url", "")
+        origin_h = origin_rule.get("headers", [])
+        origin_m = origin_rule.get("product_map", {})
+
+        # 判断是否有改动
+        has_change = (u != origin_u) or (h != origin_h) or (m != origin_m)
+
+        if has_change:
+            ret = messagebox.askyesnocancel("提示", "当前商家规则已修改，是否保存？")
+            if ret is None:
+                # 取消：不关闭窗口
+                return
+            elif ret is True:
+                # 保存，和保存按钮逻辑保持一致
+                self.rule_mgr.update_merchant_rule(self.current_merchant, m, u, h)
+                self.parent.ref_mer()
+        # 无改动 / 选不保存：直接关闭
+        self.destroy()
 
     def refresh_merchant_list(self):
         self.merchant_listbox.delete(0, tk.END)
@@ -464,6 +502,7 @@ class RuleConfigWindow(tk.Toplevel):
                 m[v[0]] = v[1]
         self.rule_mgr.update_merchant_rule(self.current_merchant, m, u, h)
         messagebox.showinfo("成功", "保存成功")
+        self.parent.ref_mer()
 
 
 # ====================== 飞书 & 工具函数 ======================
@@ -482,8 +521,18 @@ def get_beijing_date():
     return datetime.now().strftime("%Y/%m/%d")
 
 def extract_vid_from_link(link):
-    match = VID_PATTERN.search(link)
-    return match.group(1) if match else ""
+    try:
+        if not link:
+            return ""
+        match = VID_PATTERN.search(link)
+        if not match:
+            print(f"[VID未匹配] link={link}")
+            return ""
+        vid = match.group(2) or match.group(3)
+        return vid if vid else ""
+    except Exception as e:
+        print(f"[VID解析异常] link={link}, err={e}")
+        return ""
 
 # ====================== 网络 ======================
 REGION_MAP = {"CN":"大陆","HK":"香港","TW":"台湾","MO":"澳门"}
@@ -844,9 +893,13 @@ class TikTokToolGUI:
         rule = self.rule_mgr.get_merchant_rule(self.selected_merchant)
         url = rule.get("feishu_url")
         heads = rule.get("headers",[])
-        if not url or not heads:
-            messagebox.showerror("错误","请先配置当前商家的飞书链接与表头")
+        if not heads:
+            messagebox.showerror("错误", "请先配置当前商家的飞书链接与表头")
             return
+        # 链接为空直接提示，不阻断；如果为空就不调用飞书接口
+        if not url:
+            messagebox.showinfo("提示", "当前商家飞书链接为空，跳过飞书推送")
+        return
         eid = extract_feishu_excel_id(url)
         # 修改后的代码
         field_index_map = {
